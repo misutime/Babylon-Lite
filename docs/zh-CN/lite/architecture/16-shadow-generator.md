@@ -293,7 +293,15 @@ Node 解析会在管线编译前等待 `prepareNodeShadowEmitter`。其场景局
 #### 方向光阴影：矩阵计算（正交投影）
 
 ```typescript
-function _computeDirectionalLightMatrix(light: DirectionalLight, casterMeshes: Mesh[], orthoMinZ: number, orthoMaxZ: number): { viewProj: Float32Array; near: number; far: number };
+function computeDirectionalLightMatrix(
+    light: DirectionalLight,
+    casterMeshes: readonly Mesh[],
+    orthoMinZ: number,
+    orthoMaxZ: number,
+    offX?: number,
+    offY?: number,
+    offZ?: number
+): { _view: Float32Array; _viewProj: Float32Array; _near: number; _far: number };
 ```
 
 **算法：**
@@ -311,7 +319,7 @@ function _computeDirectionalLightMatrix(light: DirectionalLight, casterMeshes: M
         | -dot(r,P) -dot(u,P) -dot(dir,P) 1 |
     ```
     其中 `P = light.worldMatrix[12..14]`
-5. 将每个投射者局部 AABB（`mesh.boundMin`/`boundMax`，默认单位立方体）的所有 8 个角点依次通过 `worldMatrix` 和 `view` 变换 → 在灯光空间中计算 X/Y 边界
+5. 对于普通投射网格，将几何局部 AABB（`mesh.boundMin`/`boundMax`，默认单位立方体）的 8 个角点依次通过 `worldMatrix` 和 `view` 变换，得到灯光空间 X/Y 边界。对于薄实例，先对每个活跃实例用 `worldMatrix × instanceMatrix` 变换原型角点，合并为世界空间 AABB，再通过 `view` 变换该包围盒。只计入线性变换非零的活跃实例，活跃数量以上传的矩阵缓冲区容量为上限。实例集合为空时没有边界贡献。
 6. 按 10% 扩展边界（`shadowOrthoScale = 0.1`）：`lMinX -= (lMaxX - lMinX) * 0.1` 等
 7. 从 `orthoMinZ`/`orthoMaxZ`（相机近/远平面）获取 Z 边界
 8. 构建正交投影矩阵（列主序，WebGPU z=[0,1]）：
@@ -326,7 +334,23 @@ function _computeDirectionalLightMatrix(light: DirectionalLight, casterMeshes: M
     ```
 9. 相乘：`viewProj = proj * view`（标准 4×4 乘法）
 
-ESM 将其面向任务的 directional 矩阵辅助函数作为内部 `_computeDirectionalLightMatrix()` 放在 `shadow/esm-directional-shadow-generator.ts` 中。PCF 将相同的正交辅助函数作为内部 `_computeDirectionalLightMatrix()` 放在 `shadow/pcf-directional-shadow-generator.ts` 中，使方向光阴影生成器数学逻辑保留在各自的方向光资源配置模块内而不成为公共 API。
+方向光 ESM 和 PCF 共用 `shadow/shadow-base.ts` 中的 `computeDirectionalLightMatrix()`。投射者异步预加载时调用 `preloadDirectionalShadowBounds(casterMeshes)`，仅在存在薄实例投射者时导入 `shadow/thin-instance-shadow-bounds.ts`。CSM 直接导入同一个包围盒辅助模块。
+
+重新拟合方向光边界前，`prepareDirectionalShadowBounds(generator, casterMeshes)` 会检测已注册的普通投射网格是否转为薄实例，即使投射者数组本身的引用保持不变。辅助模块尚未就绪时，`frame-graph/shadow-inputs.ts` 中的 `_preloadRegisteredShadowCasters(generator)` 从注册表重新提供原始投射者集合，材质家族的等待路径也调用同一个辅助函数。这样可避免对形变目标或骨骼包围盒重复应用变换，并集中处理源列表和等待状态。现有阴影任务预加载器会暂停生成器、报告导入失败，并在预加载成功后恢复。PCF 的矩阵回调可返回 `null` 延后拟合，ESM 则在拟合前返回。等待期间，两条路径均保留先前的阴影贴图及脏状态跟踪版本，静态帧沿用原有的扫描频率。
+
+实际拟合通过合成后的灯光视图与世界仿射变换投影局部包围盒区间，结果与变换八个角点后取极值完全等价。每个投影行以双精度标量极值拟合，将灯光视图缩放和平移后直接写入 F32 输出，省去临时包围盒存储和稀疏 4×4 投影矩阵的分配及乘法。`getShadowLightView(light, offX, offY, offZ)` 统一处理方向光和聚光灯拟合中的节点方向到世界方向和浮动原点转换。共享的 `multiply4x4()` 复用已有的无分配 `multiplyMat4IntoBuffer()` 内核。私有缓存字段沿用阴影模块的 `_` 前缀约定。
+
+生成器持有的 `_lightMatrix` 和拟合后的 `_viewProj` 各是一份连续存放的 F32 矩阵，可直接使用原生 `TypedArray.set()` 复制。ESM 的比较复制辅助函数在发现分量不同后更新矩阵，再递增生成器版本。UBO 打包依然显式将填充字段置零。
+
+`preloadPcfShadowTaskState(casterMeshes, loads = [])` 将材质家族的导入追加到预加载批次并等待整批完成。方向光 PCF 传入 `[preloadDirectionalShadowBounds(casterMeshes)]` 作为该批次，使包围盒与材质导入并行，且共用一层异步等待。聚光灯 PCF 和 CSM 使用默认的空批次。
+
+ESM 直接选择最接近的成对采样核。设 `v = round(max(requested, 1))`，核大小为 `max(floor(v / 4) * 4 + 1, 3)`。结果与原先从五个候选值搜索的 `4k+1` 选择一致，距离相同时取较小的核，且省去候选数组及扫描。高斯权重和双线性采样点配对保持原样。
+
+`getShadowCasterWorldBounds(mesh)` 返回普通或薄实例投射者的缓存世界空间 AABB `{ min: [x,y,z], max: [x,y,z] }`，没有活跃实例贡献时返回 `null`。CSM 对所有投射者使用它，省去普通包围盒的独立角点循环，且仅相机变动触发拟合时可复用变换结果。惰性 `WeakMap<Mesh, ...>` 缓存依据实例版本、矩阵数组引用、截断后的活跃数量、网格世界矩阵版本和六个几何边界坐标判断是否有效。实例路径对仿射变换求中心与半径对应的极值，可保留带符号缩放和剪切效果。稳定条目复用输出存储，缓存仅占用 CPU 资源。
+
+惰性适配器 `getDirectionalShadowCaster(mesh)` 原样返回普通网格。对于薄实例，它复用缓存的普通包围盒视图，其中 `boundMin`/`boundMax` 直接引用缓存的世界极值，`worldMatrix` 使用单位矩阵。实例集合为空时返回 `null`。适配器及其单位矩阵只位于按需加载的模块内，拟合器以同一套矩阵及包围盒接口处理两类投射者，调用方通过预加载确保辅助模块就绪。`getThinInstanceWorldBounds(mesh)` 仍用于内部仅查询包围盒的场景，对普通网格返回 `undefined`。共享的方向光拟合器在计算世界包围盒后仅减去一次浮动原点偏移。
+
+`Mesh.boundMin`/`boundMax` 始终表示任何实例或世界变换前的原型几何包围盒，包括使用方为形变提供保守边界的情况。精确拾取、裁剪和物理继续使用原型包围盒。阴影拟合单独推导汇总边界，保留这些字段及现有公开的包围盒和投影配置。
 
 #### 聚光灯 PCF：`_computeSpotLightMatrix`（透视投影）
 
@@ -726,7 +750,7 @@ Returns: casters.length  (depth draws only — no blur passes)
 | ESM 编码（`exp(-depthScale*d)`） | `ShadowGenerator.useBlurExponentialShadowMap = true` |
 | 33 抽头高斯模糊（kernel=64） | `ShadowGenerator.useKernelBlur = true; .blurKernel = 64` |
 | PCF 5×5 双线性（9 个优化抽头） | `ShadowGenerator.filteringQuality = SM_PCF` |
-| `_computeDirectionalLightMatrix()` | `DirectionalLight._setDefaultAutoExtendShadowProjectionMatrix()` |
+| `computeDirectionalLightMatrix()` | `DirectionalLight._setDefaultAutoExtendShadowProjectionMatrix()` |
 | `_computeSpotLightMatrix()` | `SpotLight._setDefaultShadowProjectionMatrix()` |
 | `shadowOrthoScale = 0.1`（扩展比例） | `DirectionalLight.shadowOrthoScale = 0.1` |
 | 方向光 `depthValues = [0, 1]` | `DirectionalLight.getDepthMinZ()=0`, `getDepthMaxZ()=1`（WebGPU 半 Z） |
@@ -812,11 +836,12 @@ Returns: casters.length  (depth draws only — no blur passes)
 
 | 文件 | 职责 |
 | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/shadow/shadow-base.ts` | 共享阴影数学、参数 UBO、接收者 UBO 与 `writeShadowUboFields()` 辅助函数 |
+| `src/shadow/shadow-base.ts` | 共享阴影数学、方向光矩阵拟合、参数 UBO、接收者 UBO 与 `writeShadowUboFields()` 辅助函数 |
+| `src/shadow/thin-instance-shadow-bounds.ts` | 薄实例世界包围盒缓存和方向光拟合适配器 |
 | `src/shadow/shadow-generator.ts` | 共享 `ShadowGenerator` 契约 |
-| `src/shadow/esm-directional-shadow-generator.ts` | 方向光 ESM 生成器 — 阴影参数 UBO、ESM/深度/模糊纹理、模糊管线、接收者 UBO、任务资源访问器与方向光 AABB 拟合矩阵辅助函数 |
+| `src/shadow/esm-directional-shadow-generator.ts` | 方向光 ESM 生成器 — 阴影参数 UBO、ESM/深度/模糊纹理、模糊管线、接收者 UBO 与任务资源访问器 |
 | `src/shadow/pcf-spotlight-shadow-generator.ts` | 聚光灯 PCF 阴影生成器 — 工厂函数、聚光灯矩阵辅助函数、深度纹理/比较采样器所有权与聚光灯接收者深度值 |
-| `src/shadow/pcf-directional-shadow-generator.ts` | 方向光 PCF 阴影生成器 — 工厂函数、方向光 AABB 拟合矩阵辅助函数、深度纹理/比较采样器所有权与方向光接收者深度值 |
+| `src/shadow/pcf-directional-shadow-generator.ts` | 方向光 PCF 阴影生成器 — 工厂函数、深度纹理/比较采样器所有权与方向光接收者深度值 |
 | `src/frame-graph/shadow-inputs.ts` | 阴影任务的公共投射网格输入注册 |
 | `src/frame-graph/shadow-task.ts` | 内部帧图任务，在接收者渲染前调度阴影并通过 Standard/PBR/Node 阴影材质视图渲染 PCF/ESM 投射者 |
 | `src/shadow/pcf-shadow-task-hooks.ts` | 由聚光灯和方向光 PCF 生成器共用的 PCF 预加载/状态/渲染钩子 |
