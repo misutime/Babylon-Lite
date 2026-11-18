@@ -9,6 +9,15 @@ architectural and workflow decisions.
 
 ---
 
+## Keep the Chinese Lite documentation in sync
+
+- Treat `docs/lite/` as upstream English source. Put Chinese translations in `docs/zh-CN/lite/` with the same relative filenames. Apply translation-only changes in the Chinese tree.
+- Whenever you sync upstream, or notice changes to the English Lite documentation, run `pnpm --dir docs/local-site translations:check`. If it reports changes, use the Git diff from `docs/local-site/translation-base.txt` to the current English source as the translation input and update the matching Chinese pages as part of the same task.
+- Translate new or changed content, mirror document renames and removals, and verify the translated headings, anchors, code samples, and links. Reuse assets from the English tree. The bilingual site covers Babylon Lite's WebGPU documentation.
+- Once all reported changes are reflected and `pnpm --dir docs/local-site build` succeeds, set `docs/local-site/translation-base.txt` to the full SHA of the synced English source commit and run the check again. Keep the previous baseline while translation work is incomplete. See [the docs site guide](docs/local-site/README.md).
+
+---
+
 ## Release Commit Messages
 
 The release pipeline decides between a minor and major release by scanning commit
